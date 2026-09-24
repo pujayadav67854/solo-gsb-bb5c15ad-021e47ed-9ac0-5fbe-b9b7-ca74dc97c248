@@ -1,8 +1,9 @@
 """校准工位预约路由。
 
-* ``GET  /api/calibration-slots``     只读：单工位最早可用时段；
-* ``POST /api/calibration-bookings``  写事务内重查占用与证书截止后确认（409 冲突）；
-* ``GET  /api/calibration-bookings``  按仪器（可选）查询已确认预约。
+* ``GET  /api/calibration-slots``               只读：单工位最早可用时段；
+* ``POST /api/calibration-bookings``            写事务内重查占用与证书截止后确认（409 冲突）；
+* ``POST /api/calibration-bookings/reschedule`` 2～10 条已有预约批量改期（同一写事务核验，409 整体回滚）；
+* ``GET  /api/calibration-bookings``            按仪器（可选）查询已确认预约。
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from ..database import get_conn_ctx, get_db
 from ..schemas import (
     CalibrationBookingIn,
     CalibrationBookingOut,
+    CalibrationRescheduleIn,
     CalibrationSlotsOut,
 )
 
@@ -108,6 +110,49 @@ def create_calibration_booking(body: CalibrationBookingIn):
         )
     except crud.ValidationError as exc:
         raise HTTPException(422, str(exc))
+
+
+@router.post(
+    "/calibration-bookings/reschedule",
+    response_model=list[CalibrationBookingOut],
+    summary="批量改期已有预约（同一写事务内核验，冲突 409 整体回滚）",
+)
+def reschedule_calibration_bookings(body: CalibrationRescheduleIn):
+    """批量改期 **2～10 条已有预约**：在**同一写事务**（``BEGIN IMMEDIATE``）内：
+
+    1. 核对每条预约存在且预约 ID 不重复；
+    2. 逐条以新起点（``duration_seconds`` 缺省沿用原时长）重新验证该仪器
+       在新起点的唯一有效溯源链，且新结束（``start + duration_seconds``，
+       半开）不晚于起点证书 ``valid_until``；
+    3. 先把本批预约的**旧占用整体排除**，再按半开区间检查新时段**彼此**
+       及**与其他预约**的冲突——因此允许本批预约交换时段，首尾相接
+       （新起点恰等于另一段结束点）也不冲突。
+
+    任一条件不成立返回 **409**，响应体 ``detail.booking_id`` 指明失败的
+    预约 ID，并带机器可读 ``code``、中文 ``message`` 与结构化 ``detail``，
+    事务整体回滚（整批预约保持改期前状态，绝不部分更新）。全部成立才在
+    同一事务内更新各预约的时段、时长与证书快照；**原仪器、备注与创建
+    时间保持不变**，响应按请求顺序返回更新后的预约。
+    """
+    try:
+        with get_conn_ctx() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return booking.reschedule_bookings(
+                conn,
+                [
+                    {
+                        "booking_id": it.booking_id,
+                        "start": it.start,
+                        "duration_seconds": it.duration_seconds,
+                    }
+                    for it in body.items
+                ],
+            )
+    except booking.BookingConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message, "detail": exc.detail},
+        )
 
 
 @router.get(

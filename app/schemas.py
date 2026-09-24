@@ -135,6 +135,41 @@ class CalibrationBookingIn(BaseModel):
     note: str = ""
 
 
+class RescheduleItemIn(BaseModel):
+    """批量改期中的一条：已有预约 ID + 新起点（+ 可选新时长）。"""
+
+    booking_id: str = Field(..., min_length=1, description="已有预约 ID")
+    start: datetime = Field(
+        ..., description="新的开始时刻（UTC，含），如 2026-06-21T09:00:00Z"
+    )
+    duration_seconds: Optional[int] = Field(
+        None,
+        gt=0,
+        description="可选新时长（正整数秒）；缺省沿用该预约原时长",
+    )
+
+
+class CalibrationRescheduleIn(BaseModel):
+    """批量改期请求：2～10 条已有预约整体改期（保留原仪器与备注）。"""
+
+    items: List[RescheduleItemIn] = Field(
+        ...,
+        min_length=2,
+        max_length=10,
+        description="2～10 条改期项；预约 ID 不得重复（重复按 409 处理）",
+    )
+
+    @field_validator("items")
+    @classmethod
+    def _strip_booking_ids(cls, v: List[RescheduleItemIn]):
+        ids = [it.booking_id.strip() for it in v]
+        if any(not i for i in ids):
+            raise ValueError("预约 ID 不能为空字符串")
+        for it, i in zip(v, ids):
+            it.booking_id = i
+        return v
+
+
 class CommonTraceIn(BaseModel):
     """批次共同溯源核查请求（只读，不写入数据库）。"""
 

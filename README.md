@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（108 个用例）
+pytest -q        # 运行测试（124 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -134,6 +134,7 @@ calibration_bookings（校准工位预约；全实验室单个工位，半开区
 | **GET** | **`/api/coverage/{instrument}?start=&end=`** | **仪器时间窗覆盖查询：按有效期边界输出状态区段** |
 | **GET** | **`/api/calibration-slots?instrument=&start=&end=&duration_seconds=`** | **校准工位空档查询：单工位半开占用，返回时间窗内最早可用时段** |
 | **POST** | **`/api/calibration-bookings`** | **确认校准工位预约（同一写事务内重查占用与证书截止，冲突 409）** |
+| **POST** | **`/api/calibration-bookings/reschedule`** | **批量改期 2～10 条已有预约（同一写事务核验，冲突 409 整体回滚）** |
 | **GET** | **`/api/calibration-bookings?instrument=`** | **预约列表（可按仪器筛选）** |
 | **GET** | **`/api/export/{instrument}?at=`** | **JSON 导出（attachment 下载）** |
 | **POST** | **`/api/assessments/certificate-deactivation`** | **证书停用影响评估（dry-run，不写库）** |
@@ -476,6 +477,57 @@ curl "http://localhost:8000/api/calibration-bookings"
 入参/状态码：时间均按 UTC（建议 `...Z`）；`duration_seconds` 须为正整数
 （否则 422）；`start` 不早于 `end`、时长不超过窗长，否则 422；
 仪器不存在 GET 返回 404，POST 在写事务内确认时返回 409。
+
+**④ 批量改期（POST /api/calibration-bookings/reschedule，写事务，冲突 409）。**
+一次提交 **2～10 条**已有预约的改期项（`booking_id` + 新起点 `start` +
+**可选**新时长 `duration_seconds`，缺省沿用原时长）。**保留原仪器与备注**
+（创建时间同样不变）。服务端在**同一写事务**（`BEGIN IMMEDIATE`）内：
+
+1. 核对每条预约均存在且本批预约 **ID 不重复**；
+2. 逐条按**新起点重新验证**该仪器唯一有效溯源链（重查，不沿用旧证书
+   快照），新结束（`start + duration_seconds`，半开）不晚于新起点
+   证书 `valid_until`；
+3. 先把本批预约的**旧占用整体排除**，再按半开区间检查新时段**彼此**
+   及**与其他预约**的冲突——因此允许本批预约**交换时段**（如 A、B
+   互换原占用），也允许**首尾相接**（新起点恰等于另一段结束点）。
+
+任一条件不成立即返回 **409**（`detail.booking_id` 指明失败预约）并
+**整体回滚**（整批保持改期前状态，绝不部分更新）；全部通过才在同一
+事务内更新各预约的时段、时长与证书快照，响应按请求顺序返回。
+
+```bash
+curl -X POST http://localhost:8000/api/calibration-bookings/reschedule \
+  -H 'Content-Type: application/json' -d '{
+    "items": [
+      {"booking_id": "BK-DEMO-20260620-W1", "start": "2026-06-21T09:00:00Z"},
+      {"booking_id": "BK-20260620-aaaaaaaaaaaa",
+       "start": "2026-06-21T10:00:00Z", "duration_seconds": 5400}
+    ]
+  }'
+# 200
+# [ {"id":"BK-DEMO-20260620-W1", "instrument_code":"INST-W1",
+#    "start_at":"2026-06-21T09:00:00Z", "end_at":"2026-06-21T10:00:00Z",
+#    "duration_seconds":3600, "certificate_id":"CW1-1",
+#    "certificate_valid_until":"2027-01-01T00:00:00Z", "note":"演示数据：数显卡尺例行校准", ...},
+#   {"id":"BK-20260620-aaaaaaaaaaaa", ..., "duration_seconds":5400,
+#    "end_at":"2026-06-21T11:30:00Z", ...} ]
+```
+
+改期特有的 409 原因码（其余复用确认预约的四条）：
+
+| `detail.code` | 触发条件 |
+| --- | --- |
+| `BOOKING_NOT_FOUND` | 某条预约 ID 在库中不存在（`detail.booking_id`） |
+| `DUPLICATE_BOOKING_ID` | 请求中预约 ID 重复（`detail.booking_id`） |
+| `INSTRUMENT_NOT_FOUND` | 预约所属仪器已不存在（附 `booking_id`） |
+| `TRACEABILITY_CHAIN_UNAVAILABLE` | 新起点唯一有效链不成立（附 `booking_id` 与 `trace_report`） |
+| `BOOKING_ENDS_AFTER_CERT_EXPIRY` | 新结束晚于新起点证书截止（附 `booking_id` 与两者时刻） |
+| `STATION_OCCUPIED` | 新时段与其他预约冲突（`conflicting_bookings`）或本批新时段彼此冲突（`conflicting_batch_bookings`），均附 `booking_id` |
+
+> 改期只更新 `start_at / end_at / duration_seconds / certificate_id /
+> certificate_valid_until`；**仪器、备注与创建时间不变**。改期项少于
+> 2 条或多于 10 条、`duration_seconds` 非正数、ID 为空白字符串时
+> 返回 **422**（ID 重复与不存在在写事务内核验，返回 **409**）。
 
 ### 5）证书停用影响评估（dry-run 模拟）
 
@@ -1086,6 +1138,18 @@ curl -G "http://localhost:8000/api/calibration-slots" \
 
 # 按仪器查询已确认预约
 curl "http://localhost:8000/api/calibration-bookings?instrument=INST-W1"
+
+# 批量改期：演示预约与刚确认的预约一起后移一天（时长缺省沿用原值，
+# 仪器与备注保留；本批旧占用整体排除，允许交换时段与首尾相接）
+curl -X POST http://localhost:8000/api/calibration-bookings/reschedule \
+  -H 'Content-Type: application/json' -d '{
+    "items": [
+      {"booking_id": "BK-DEMO-20260620-W1", "start": "2026-06-21T09:00:00Z"},
+      {"booking_id": "<上一步返回的预约 id>", "start": "2026-06-21T10:00:00Z"}
+    ]
+  }'
+# 200：两条预约时段更新；任一核验失败（预约不存在 / 链不可用 /
+# 越过证书截止 / 时段冲突）则 409 且整批回滚
 ```
 
 ## 七、溯源算法说明
@@ -1117,7 +1181,11 @@ curl "http://localhost:8000/api/calibration-bookings?instrument=INST-W1"
    半开相交的既有预约（不分仪器）贪心求最早可容纳所需时长的空档。
    POST 在 `BEGIN IMMEDIATE` 同一写事务内重查仪器、溯源链、证书截止与
    半开占用，任一不满足即 409 回滚，全部满足才原子写入；因此并发确认
-   同一时段恰有一个成功，不产生重叠预约。
+   同一时段恰有一个成功，不产生重叠预约。批量改期（reschedule）同样在
+   同一写事务内：核对 2～10 条预约存在且 ID 不重复，逐条按新起点重验
+   唯一有效链与证书截止，将本批旧占用整体排除后按半开区间检查新时段
+   彼此及与其他预约的冲突（允许交换时段与首尾相接），任一失败整体
+   回滚，全部通过才更新时段与证书快照（仪器与备注不变）。
 10. 测量相容性评估：对每条读数复用步骤 1~5（只读），仅以“唯一成链且
     零 ERROR”的链参与，取起点证书扩展不确定度为 U；链不可用或起点证书
     单位与目标单位不符的读数逐条记录原因、不参与。对可参与读数两两计算
@@ -1146,14 +1214,16 @@ app/
                      测量相容性评估（En 数 + 极大团分组）、
                      unique_chain_gate（唯一有效链门禁，工位预约复用）
   booking.py         校准工位预约：单工位半开占用查询、最早空档贪心、
-                     写事务内重查确认（409 冲突）与预约持久化/列表
+                     写事务内重查确认（409 冲突）、批量改期（旧占用整体
+                     排除后核验新时段，409 整体回滚）与预约持久化/列表
   seed.py            五场景演示数据 + 1 条校准工位演示预约
   routers/           instruments / certificates（含修订历史 revisions
                      与两版差异 diff）/ edges /
                      submissions（批量提交 + preflight 预检）/
                      trace(report + 时间窗覆盖 + 停用影响评估 + 批次共同溯源核查
                      + 测量相容性评估) /
-                     calibration（工位空档 GET + 预约确认 POST + 预约列表 GET）/
+                     calibration（工位空档 GET + 预约确认 POST + 批量改期
+                     POST + 预约列表 GET）/
                      export / admin
 tests/test_trace.py          10 个接口级测试
 tests/test_preflight.py      11 个批量提交预检测试
@@ -1162,6 +1232,7 @@ tests/test_coverage.py       10 个仪器时间窗覆盖查询测试
 tests/test_common_trace.py   12 个批次共同溯源核查测试
 tests/test_measurement_compatibility.py  14 个测量相容性评估测试
 tests/test_calibration.py    28 个校准工位预约测试
+tests/test_reschedule.py     16 个批量改期测试
 tests/test_revisions.py      15 个证书修订历史测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```
