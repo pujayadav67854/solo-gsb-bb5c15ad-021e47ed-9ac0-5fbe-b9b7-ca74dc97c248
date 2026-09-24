@@ -12,6 +12,11 @@
 * ``GET`` 只读：返回时间窗内（受证书截止裁剪后）最早可容纳所需时长的
   时段；``POST`` 在同一写事务内（``BEGIN IMMEDIATE``）重查占用与证书
   截止，冲突返回 409，随后原子写入 SQLite。
+* ``POST /reschedule`` 批量改期：一次写事务内核对 2～10 条预约存在且
+  ID 不重复，先把本批预约的旧占用整体排除，再按半开区间检查新时段彼此
+  及与其他预约的冲突（允许交换时段、允许首尾相接），并对每条新起点
+  重新验证唯一有效溯源链与证书截止；任一失败 409 回滚，全部通过才
+  更新时段与证书快照（仪器、备注保持不变）。
 """
 from __future__ import annotations
 
@@ -35,6 +40,10 @@ CONFLICT_INSTRUMENT_NOT_FOUND = "INSTRUMENT_NOT_FOUND"
 CONFLICT_CHAIN_UNAVAILABLE = "TRACEABILITY_CHAIN_UNAVAILABLE"
 CONFLICT_ENDS_AFTER_CERT_EXPIRY = "BOOKING_ENDS_AFTER_CERT_EXPIRY"
 CONFLICT_STATION_OCCUPIED = "STATION_OCCUPIED"
+
+# POST /reschedule 批量改期冲突原因码
+CONFLICT_BOOKING_NOT_FOUND = "BOOKING_NOT_FOUND"
+CONFLICT_BOOKING_ID_DUPLICATED = "BOOKING_ID_DUPLICATED"
 
 _BOOKING_FIELDS = (
     "id",
@@ -397,3 +406,271 @@ def confirm_booking(
         certificate_valid_until=deadline_s,
         note=note,
     )
+
+
+# ---------------------------------------------------------------- 批量改期
+
+def _reschedule_failure(
+    booking_id: str, code: str, message: str, detail: Optional[dict] = None
+) -> dict[str, Any]:
+    """构造批量改期 409 响应中的单条预约失败项。"""
+    return {
+        "booking_id": booking_id,
+        "code": code,
+        "message": message,
+        "detail": detail or {},
+    }
+
+
+def reschedule_bookings(
+    conn: sqlite3.Connection,
+    items: list[tuple[str, datetime, Optional[int]]],
+) -> list[dict[str, Any]]:
+    """在**同一写事务**内对 2～10 条已有预约做批量改期。
+
+    入参 ``items`` 为 ``(booking_id, new_start, new_duration_seconds)`` 三元组，
+    ``new_duration_seconds`` 为 None 时沿用该预约原时长。调用方必须提供已执行
+    ``BEGIN IMMEDIATE`` 的连接；COMMIT/ROLLBACK 由调用方负责。
+
+    检查顺序（任一阶段产生失败项即抛 :class:`BookingConflict`，码
+    ``STATION_OCCUPIED``，``detail.failures`` 逐条给出预约 ID 与原因码，
+    事务回滚、绝不更新）：
+
+    1. 请求内预约 ID 不重复（写事务内核对，区别于请求体层 422 的条数校验）；
+    2. 每条预约在库中存在；
+    3. 对每条预约（保留原仪器、原备注）按新起点重新验证唯一有效溯源链
+       （仪器仍存在 / 链唯一且通过校验 / 结束不晚于新起点证书到期）；
+    4. 把**本批预约的旧占用整体排除**后，新时段按半开区间两两互不重叠，
+       且均不与本批之外的其他预约重叠——因此交换两条预约的时段、以及
+       新时段与旧占用首尾相接都允许。
+
+    全部通过才在同一事务内更新 start_at/end_at/duration_seconds 及证书
+    快照（certificate_id/certificate_valid_until），按请求顺序返回更新后的
+    预约；instrument_code/note/created_at 保持不变。
+    """
+    # 0) 规整入参：新时长缺省沿用原时长，正时长在函数层再兜底校验一次
+    request_ids = [bid for bid, _, _ in items]
+    parsed: list[tuple[str, datetime, Optional[int]]] = []
+    for bid, start, duration in items:
+        if duration is not None and duration <= 0:
+            raise ValidationError("改期新时长 duration_seconds 必须为正整数秒")
+        parsed.append((bid, to_utc_naive(start), duration))
+
+    failures: list[dict[str, Any]] = []
+
+    # 1) ID 不重复（按请求顺序记录首次出现的重复项）
+    seen: set[str] = set()
+    duplicate_ids: set[str] = set()
+    for bid in request_ids:
+        if bid in seen:
+            duplicate_ids.add(bid)
+            failures.append(
+                _reschedule_failure(
+                    bid,
+                    CONFLICT_BOOKING_ID_DUPLICATED,
+                    f"批量改期请求中预约 ID 重复出现: {bid}，每条预约至多改期一次",
+                )
+            )
+        seen.add(bid)
+
+    # 2) 预约存在性（重复 ID 不重复报缺失）
+    rows_by_id: dict[str, sqlite3.Row] = {}
+    for bid, _, _ in parsed:
+        if bid in duplicate_ids:
+            continue
+        row = conn.execute(
+            "SELECT * FROM calibration_bookings WHERE id=?", (bid,)
+        ).fetchone()
+        if row is None:
+            failures.append(
+                _reschedule_failure(
+                    bid,
+                    CONFLICT_BOOKING_NOT_FOUND,
+                    f"预约不存在: {bid}",
+                )
+            )
+        else:
+            rows_by_id[bid] = row
+
+    # 3) 逐条按新起点重新验证溯源门禁与证书截止（仅对有效条目）
+    plans: list[dict[str, Any]] = []
+    for bid, start_naive, new_duration in parsed:
+        row = rows_by_id.get(bid)
+        if row is None:
+            continue
+        instrument_code = row["instrument_code"]
+        duration_seconds = (
+            new_duration if new_duration is not None else row["duration_seconds"]
+        )
+        end_naive = start_naive + timedelta(seconds=duration_seconds)
+        start_s, end_s = fmt(start_naive), fmt(end_naive)
+
+        if get_instrument(conn, instrument_code) is None:
+            failures.append(
+                _reschedule_failure(
+                    bid,
+                    CONFLICT_INSTRUMENT_NOT_FOUND,
+                    f"预约 {bid} 所属仪器已不存在: {instrument_code}",
+                    {"instrument_code": instrument_code},
+                )
+            )
+            continue
+
+        gate = unique_chain_gate(conn, instrument_code, start_naive)
+        if not gate["ok"]:
+            failures.append(
+                _reschedule_failure(
+                    bid,
+                    CONFLICT_CHAIN_UNAVAILABLE,
+                    f"改期新起点 {start_s} 仪器 {instrument_code} 的唯一有效溯源链"
+                    "不可用：" + gate["reason"],
+                    {
+                        "instrument_code": instrument_code,
+                        "reason_code": gate["reason_code"],
+                        "trace_report": gate["report"],
+                    },
+                )
+            )
+            continue
+
+        cert_id = gate["start_certificate_id"]
+        deadline_s = gate["certificate_valid_until"]
+        if end_s > deadline_s:
+            failures.append(
+                _reschedule_failure(
+                    bid,
+                    CONFLICT_ENDS_AFTER_CERT_EXPIRY,
+                    f"改期后预约结束 {end_s} 晚于仪器 {instrument_code} 新起点证书 "
+                    f"{cert_id} 的到期时刻 {deadline_s}，预约必须在证书到期前结束",
+                    {
+                        "instrument_code": instrument_code,
+                        "certificate_id": cert_id,
+                        "certificate_valid_until": deadline_s,
+                        "booking_start": start_s,
+                        "booking_end": end_s,
+                    },
+                )
+            )
+            continue
+
+        plans.append(
+            {
+                "booking_id": bid,
+                "row": row,
+                "instrument_code": instrument_code,
+                "start_s": start_s,
+                "end_s": end_s,
+                "duration_seconds": duration_seconds,
+                "certificate_id": cert_id,
+                "certificate_valid_until": deadline_s,
+            }
+        )
+
+    # 4) 半开占用重查：本批旧占用（ID 集合）整体排除，仅看本批之外的预约
+    batch_id_set = set(rows_by_id) | duplicate_ids
+    plan_by_id = {p["booking_id"]: p for p in plans}
+    occupied: dict[str, list[dict[str, Any]]] = {p["booking_id"]: [] for p in plans}
+    for p in plans:
+        # 分批 ID 数量不定（2~10），用参数占位符展开；缺失/重复 ID 一并排除
+        placeholders = ",".join("?" for _ in batch_id_set) or "''"
+        external_rows = conn.execute(
+            f"SELECT * FROM calibration_bookings "
+            f"WHERE start_at < ? AND end_at > ? AND id NOT IN ({placeholders}) "
+            f"ORDER BY start_at, id",
+            (p["end_s"], p["start_s"], *sorted(batch_id_set)),
+        ).fetchall()
+        if external_rows:
+            occupied[p["booking_id"]] = [_booking_dict(r) for r in external_rows]
+
+    # 4b) 新时段彼此之间也按半开区间检查（允许交换、允许首尾相接）
+    sibling_conflicts: dict[str, list[dict[str, Any]]] = {
+        p["booking_id"]: [] for p in plans
+    }
+    for i, pa in enumerate(plans):
+        for pb in plans[i + 1 :]:
+            # 半开重叠：a.start < b.end AND b.start < a.end
+            if pa["start_s"] < pb["end_s"] and pb["start_s"] < pa["end_s"]:
+                sibling_conflicts[pa["booking_id"]].append(
+                    {
+                        "booking_id": pb["booking_id"],
+                        "instrument_code": pb["instrument_code"],
+                        "start_at": pb["start_s"],
+                        "end_at": pb["end_s"],
+                    }
+                )
+                sibling_conflicts[pb["booking_id"]].append(
+                    {
+                        "booking_id": pa["booking_id"],
+                        "instrument_code": pa["instrument_code"],
+                        "start_at": pa["start_s"],
+                        "end_at": pa["end_s"],
+                    }
+                )
+
+    for p in plans:
+        ext = occupied[p["booking_id"]]
+        sibs = sibling_conflicts[p["booking_id"]]
+        if ext or sibs:
+            failures.append(
+                _reschedule_failure(
+                    p["booking_id"],
+                    CONFLICT_STATION_OCCUPIED,
+                    f"改期后时段 {p['start_s']} ~ {p['end_s']}（半开区间）与"
+                    f" {len(ext)} 条本批之外预约、{len(sibs)} 条同批改期预约冲突",
+                    {
+                        "instrument_code": p["instrument_code"],
+                        "new_start": p["start_s"],
+                        "new_end": p["end_s"],
+                        "conflicting_bookings": ext,
+                        "conflicting_rescheduled_bookings": sibs,
+                    },
+                )
+            )
+
+    if failures:
+        # 去重（同一预约只保留首个失败项）并按请求顺序排列
+        ordered: list[dict[str, Any]] = []
+        reported: set[str] = set()
+        for bid in request_ids:
+            if bid in reported:
+                continue
+            entry = next((x for x in failures if x["booking_id"] == bid), None)
+            if entry is None:
+                continue  # 该预约通过全部核验
+            ordered.append(entry)
+            reported.add(bid)
+        raise BookingConflict(
+            ordered[0]["code"],
+            f"批量改期 {len(ordered)} 条预约未通过写事务内核验，已整体回滚",
+            {"failure_count": len(ordered), "failures": ordered},
+        )
+
+    # 5) 全部通过：在同一事务内更新时段与证书快照；仪器/备注/created_at 不变
+    results: list[dict[str, Any]] = []
+    for bid, _, _ in parsed:
+        p = plan_by_id[bid]
+        conn.execute(
+            """
+            UPDATE calibration_bookings
+               SET start_at=:start_at,
+                   end_at=:end_at,
+                   duration_seconds=:duration_seconds,
+                   certificate_id=:certificate_id,
+                   certificate_valid_until=:certificate_valid_until
+             WHERE id=:id
+            """,
+            {
+                "id": bid,
+                "start_at": p["start_s"],
+                "end_at": p["end_s"],
+                "duration_seconds": p["duration_seconds"],
+                "certificate_id": p["certificate_id"],
+                "certificate_valid_until": p["certificate_valid_until"],
+            },
+        )
+    for bid, _, _ in parsed:
+        row = conn.execute(
+            "SELECT * FROM calibration_bookings WHERE id=?", (bid,)
+        ).fetchone()
+        results.append(_booking_dict(row))
+    return results

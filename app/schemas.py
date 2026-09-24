@@ -135,6 +135,35 @@ class CalibrationBookingIn(BaseModel):
     note: str = ""
 
 
+class CalibrationRescheduleItemIn(BaseModel):
+    """批量改期中的一条：已有预约 ID + 新起点，可选新时长（留空沿用原时长）。"""
+
+    booking_id: str = Field(..., min_length=1, description="已确认的预约 ID")
+    start: datetime = Field(
+        ..., description="改期后新起点（UTC，含），如 2026-06-20T14:00:00Z"
+    )
+    duration_seconds: Optional[int] = Field(
+        None,
+        gt=0,
+        description="改期后新时长（正整数秒）；留空则沿用该预约原时长",
+    )
+
+
+class CalibrationBookingRescheduleIn(BaseModel):
+    """批量改期请求：2～10 条已有预约的新起点（及可选新时长）。
+
+    仪器与备注以库中既有预约为准，改期不修改；ID 重复与预约存在性在
+    写事务内核对（冲突 409），结构性校验（条数/正时长）在请求体层 422。
+    """
+
+    bookings: List[CalibrationRescheduleItemIn] = Field(
+        ...,
+        min_length=2,
+        max_length=10,
+        description="待改期预约列表（2～10 条），响应按此顺序返回",
+    )
+
+
 class CommonTraceIn(BaseModel):
     """批次共同溯源核查请求（只读，不写入数据库）。"""
 

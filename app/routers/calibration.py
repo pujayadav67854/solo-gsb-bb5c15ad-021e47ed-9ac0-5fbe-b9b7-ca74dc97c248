@@ -1,8 +1,9 @@
 """校准工位预约路由。
 
-* ``GET  /api/calibration-slots``     只读：单工位最早可用时段；
-* ``POST /api/calibration-bookings``  写事务内重查占用与证书截止后确认（409 冲突）；
-* ``GET  /api/calibration-bookings``  按仪器（可选）查询已确认预约。
+* ``GET  /api/calibration-slots``               只读：单工位最早可用时段；
+* ``POST /api/calibration-bookings``            写事务内重查占用与证书截止后确认（409 冲突）；
+* ``POST /api/calibration-bookings/reschedule`` 2～10 条预约批量改期（同一写事务，冲突 409）；
+* ``GET  /api/calibration-bookings``            按仪器（可选）查询已确认预约。
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from ..database import get_conn_ctx, get_db
 from ..schemas import (
     CalibrationBookingIn,
     CalibrationBookingOut,
+    CalibrationBookingRescheduleIn,
     CalibrationSlotsOut,
 )
 
@@ -124,3 +126,50 @@ def list_calibration_bookings(
     if instrument is not None and crud.get_instrument(db, instrument) is None:
         raise HTTPException(404, f"仪器不存在: {instrument}")
     return booking.list_bookings(db, instrument)
+
+
+@router.post(
+    "/calibration-bookings/reschedule",
+    response_model=list[CalibrationBookingOut],
+    status_code=200,
+    summary="批量改期（2～10 条；同一写事务内核验，冲突 409，整体回滚）",
+)
+def reschedule_calibration_bookings(body: CalibrationBookingRescheduleIn):
+    """对 2～10 条**已有预约**批量改期：每条给新起点与可选新时长
+    （留空沿用原时长），结束时间由服务端按 ``start + duration_seconds``
+    计算；**仪器与备注沿用原预约，不随请求修改**。
+
+    在**同一写事务**（``BEGIN IMMEDIATE``）内完成全部核验：
+
+    1. 请求中的预约 ID 互不重复、且每条预约在库中存在；
+    2. 对每条预约的**新起点**重新验证该仪器唯一有效溯源链（不沿用旧结果），
+       且改期后结束不晚于新起点证书 ``valid_until``；
+    3. 先把**本批预约的旧占用整体排除**，再按半开区间检查新时段：新时段
+       **彼此之间**及与**本批之外其他预约**均不得重叠
+       （``b.start < end AND b.end > start``）。因此两条预约**交换时段**、
+       以及新时段与其他占用**首尾相接**（如 ``10:00`` 紧接 ``[09,10)``）
+       都允许。
+
+    任一条件不成立返回 **409**：顶层 ``detail.code`` 取请求顺序中第一条
+    失败预约的原因码，``detail.failures`` 按请求顺序逐条给出
+    ``booking_id`` / ``code``（``BOOKING_NOT_FOUND`` /
+    ``BOOKING_ID_DUPLICATED`` / ``INSTRUMENT_NOT_FOUND`` /
+    ``TRACEABILITY_CHAIN_UNAVAILABLE`` / ``BOOKING_ENDS_AFTER_CERT_EXPIRY`` /
+    ``STATION_OCCUPIED``）/ 中文 ``message`` / 结构化 ``detail``，
+    事务回滚、绝无部分更新。全部通过才在同一事务内更新时段与证书快照，
+    并按请求顺序返回改期后的预约。
+    """
+    items = [
+        (b.booking_id, b.start, b.duration_seconds) for b in body.bookings
+    ]
+    try:
+        with get_conn_ctx() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return booking.reschedule_bookings(conn, items)
+    except booking.BookingConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message, "detail": exc.detail},
+        )
+    except crud.ValidationError as exc:
+        raise HTTPException(422, str(exc))

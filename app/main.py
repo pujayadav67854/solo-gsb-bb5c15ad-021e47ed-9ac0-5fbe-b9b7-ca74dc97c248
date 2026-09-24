@@ -137,6 +137,11 @@ def root():
                 "POST /api/calibration-bookings"
                 "（同一写事务内重查占用与证书截止，冲突 409）"
             ),
+            "calibration_booking_reschedule": (
+                "POST /api/calibration-bookings/reschedule"
+                "（2～10 条批量改期：排除本批旧占用后半开重查，"
+                "允许交换时段/首尾相接，逐条重验溯源链，冲突 409 回滚）"
+            ),
             "calibration_booking_list": "GET /api/calibration-bookings?instrument=",
         },
         "demo_query_time": DEMO_AT,

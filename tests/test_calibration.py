@@ -565,3 +565,334 @@ def test_list_bookings_by_instrument(client):
 def test_list_bookings_unknown_instrument_404(client):
     r = client.get("/api/calibration-bookings", params={"instrument": "GHOST"})
     assert r.status_code == 404
+
+
+# ------------------------------------------------ POST bookings/reschedule
+
+def _book(client, *, code="W", start, duration=3600, note=""):
+    """确认一条预约并返回其 ID。"""
+    r = client.post("/api/calibration-bookings", json={
+        "instrument_code": code,
+        "start": start,
+        "duration_seconds": duration,
+        "note": note,
+    })
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def _reschedule(client, items):
+    return client.post("/api/calibration-bookings/reschedule",
+                       json={"bookings": items})
+
+
+def test_reschedule_moves_two_bookings(client):
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z", note="甲")
+    b = _book(client, start="2026-06-20T11:00:00Z", note="乙")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T14:00:00Z"},
+        {"booking_id": b, "start": "2026-06-20T15:00:00Z"},
+    ])
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert [x["id"] for x in out] == [a, b]   # 按请求顺序返回
+    assert out[0]["start_at"] == "2026-06-20T14:00:00Z"
+    assert out[0]["end_at"] == "2026-06-20T15:00:00Z"
+    assert out[0]["duration_seconds"] == 3600  # 缺省沿用原时长
+    assert out[0]["note"] == "甲"               # 备注保留
+    assert out[0]["instrument_code"] == "W"     # 仪器保留
+    assert out[1]["start_at"] == "2026-06-20T15:00:00Z"
+    assert out[1]["end_at"] == "2026-06-20T16:00:00Z"
+    assert out[1]["note"] == "乙"
+    # 旧时段已释放：现在可在 09:00 新约（半开），且新时段已被占用
+    rows = client.get("/api/calibration-bookings").json()
+    assert sorted(x["start_at"] for x in rows) == [
+        "2026-06-20T14:00:00Z", "2026-06-20T15:00:00Z"]
+
+
+def test_reschedule_swap_slots_allowed(client):
+    """交换两条预约的时段：本批旧占用整体排除，互换不冲突。"""
+    _chain(client, code="W")
+    _chain(client, code="W2")
+    a = _book(client, code="W", start="2026-06-20T09:00:00Z")
+    b = _book(client, code="W2", start="2026-06-20T10:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T10:00:00Z"},  # 占 B 的旧位
+        {"booking_id": b, "start": "2026-06-20T09:00:00Z"},  # 占 A 的旧位
+    ])
+    assert r.status_code == 200, r.text
+    out = {x["id"]: x for x in r.json()}
+    assert out[a]["start_at"] == "2026-06-20T10:00:00Z"
+    assert out[b]["start_at"] == "2026-06-20T09:00:00Z"
+    # 仪器、备注未被串改
+    assert out[a]["instrument_code"] == "W"
+    assert out[b]["instrument_code"] == "W2"
+
+
+def test_reschedule_back_to_back_allowed(client):
+    """新时段彼此首尾相接（半开）不冲突。"""
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T10:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T11:00:00Z"},  # [11,12)
+        {"booking_id": b, "start": "2026-06-20T12:00:00Z"},  # [12,13) 相接
+    ])
+    assert r.status_code == 200, r.text
+
+
+def test_reschedule_overlap_with_own_old_slot_allowed(client):
+    """新时段与自身旧占用重叠不应计冲突（本批旧占用整体排除）。"""
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T09:30:00Z"},  # 与自己旧段重叠
+        {"booking_id": b, "start": "2026-06-20T13:00:00Z"},
+    ])
+    assert r.status_code == 200, r.text
+    out = {x["id"]: x for x in r.json()}
+    assert out[a]["start_at"] == "2026-06-20T09:30:00Z"
+    assert out[a]["end_at"] == "2026-06-20T10:30:00Z"
+
+
+def test_reschedule_new_slots_overlap_each_other_409(client):
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T14:00:00Z"},  # [14,15)
+        {"booking_id": b, "start": "2026-06-20T14:30:00Z"},  # [14:30,15:30)
+    ])
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "STATION_OCCUPIED"
+    failures = {f["booking_id"]: f for f in detail["detail"]["failures"]}
+    assert set(failures) == {a, b}
+    for f in failures.values():
+        assert f["code"] == "STATION_OCCUPIED"
+        assert len(f["detail"]["conflicting_rescheduled_bookings"]) == 1
+        assert f["detail"]["conflicting_bookings"] == []
+    # 整体回滚：两条仍是旧时段
+    rows = {x["id"]: x for x in client.get("/api/calibration-bookings").json()}
+    assert rows[a]["start_at"] == "2026-06-20T09:00:00Z"
+    assert rows[b]["start_at"] == "2026-06-20T11:00:00Z"
+
+
+def test_reschedule_external_booking_overlap_409(client):
+    """与本批之外的预约冲突：不在批次中的第三方占用照常阻塞。"""
+    _chain(client, code="W")
+    _chain(client, code="W2")
+    a = _book(client, code="W", start="2026-06-20T09:00:00Z")
+    b = _book(client, code="W", start="2026-06-20T10:00:00Z")
+    c = _book(client, code="W2", start="2026-06-20T14:30:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T14:00:00Z"},  # [14,15) 撞 C
+        {"booking_id": b, "start": "2026-06-20T16:00:00Z"},  # 本身可行
+    ])
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    failures = detail["detail"]["failures"]
+    assert [f["booking_id"] for f in failures] == [a]
+    fa = failures[0]
+    assert fa["code"] == "STATION_OCCUPIED"
+    assert [x["id"] for x in fa["detail"]["conflicting_bookings"]] == [c]
+    # 同批 B 虽单独可行也随整体回滚，保持旧时段
+    rows = {x["id"]: x for x in client.get("/api/calibration-bookings").json()}
+    assert rows[a]["start_at"] == "2026-06-20T09:00:00Z"
+    assert rows[b]["start_at"] == "2026-06-20T10:00:00Z"
+
+
+def test_reschedule_touching_external_booking_allowed(client):
+    """新起点恰等于第三方预约结束点（半开相接）不冲突。"""
+    _chain(client, code="W")
+    _chain(client, code="W2")
+    c = _book(client, code="W2", start="2026-06-20T14:00:00Z")  # [14,15)
+    a = _book(client, code="W", start="2026-06-20T09:00:00Z")
+    b = _book(client, code="W", start="2026-06-20T10:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T15:00:00Z"},  # 紧接 C
+        {"booking_id": b, "start": "2026-06-20T16:00:00Z"},
+    ])
+    assert r.status_code == 200, r.text
+    assert c not in [x["id"] for x in r.json()]  # 批次外预约原样不动
+
+
+def test_reschedule_missing_booking_409(client):
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T15:00:00Z"},
+        {"booking_id": "BK-GHOST", "start": "2026-06-20T16:00:00Z"},
+    ])
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "BOOKING_NOT_FOUND"
+    failures = detail["detail"]["failures"]
+    # A 改到 15:00 与任何占用都不冲突，不应出现在失败项中
+    assert all(f["booking_id"] != a for f in failures)
+    f_missing = next(f for f in failures
+                     if f["booking_id"] == "BK-GHOST")
+    assert f_missing["code"] == "BOOKING_NOT_FOUND"
+    # 回滚：A 仍是旧时段
+    rows = client.get("/api/calibration-bookings").json()
+    assert rows[0]["start_at"] == "2026-06-20T09:00:00Z"
+
+
+def test_reschedule_duplicate_id_409(client):
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T14:00:00Z"},
+        {"booking_id": a, "start": "2026-06-20T15:00:00Z"},
+        {"booking_id": b, "start": "2026-06-20T16:00:00Z"},
+    ])
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "BOOKING_ID_DUPLICATED"
+    dup = [f for f in detail["detail"]["failures"]
+           if f["code"] == "BOOKING_ID_DUPLICATED"]
+    assert [f["booking_id"] for f in dup] == [a]  # 第二次出现报一次
+    # 重复 ID 自身的两个条目都不参与占用/溯源核验，B 不误伤
+    assert all(f["booking_id"] != b for f in detail["detail"]["failures"])
+
+
+def test_reschedule_chain_unavailable_at_new_start_409(client):
+    # 起点证书 2027-01-01 到期：改到 2030 年新起点无有效起点证书
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2030-06-20T09:00:00Z"},
+        {"booking_id": b, "start": "2026-06-20T15:00:00Z"},
+    ])
+    assert r.status_code == 409
+    failures = r.json()["detail"]["detail"]["failures"]
+    fa = next(f for f in failures if f["booking_id"] == a)
+    assert fa["code"] == "TRACEABILITY_CHAIN_UNAVAILABLE"
+    assert fa["detail"]["reason_code"] == "NO_ACTIVE_CERTIFICATE"
+    assert fa["detail"]["trace_report"]["resolution"] == "broken"
+
+
+def test_reschedule_ends_after_cert_expiry_409(client):
+    _chain(client, leaf_until="2027-01-01T00:00:00Z")
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-12-31T23:00:00Z",
+         "duration_seconds": 7200},   # end 2027-01-01T01:00 > 截止
+        {"booking_id": b, "start": "2026-06-20T15:00:00Z"},
+    ])
+    assert r.status_code == 409
+    failures = r.json()["detail"]["detail"]["failures"]
+    fa = next(f for f in failures if f["booking_id"] == a)
+    assert fa["code"] == "BOOKING_ENDS_AFTER_CERT_EXPIRY"
+    assert fa["detail"]["certificate_valid_until"] == "2027-01-01T00:00:00Z"
+    rows = {x["id"]: x for x in client.get("/api/calibration-bookings").json()}
+    assert rows[a]["start_at"] == "2026-06-20T09:00:00Z"
+
+
+def test_reschedule_end_exactly_at_expiry_allowed(client):
+    _chain(client, leaf_until="2027-01-01T00:00:00Z")
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-12-31T23:00:00Z",
+         "duration_seconds": 3600},   # end == valid_until
+        {"booking_id": b, "start": "2026-06-20T15:00:00Z"},
+    ])
+    assert r.status_code == 200, r.text
+    out = {x["id"]: x for x in r.json()}
+    assert out[a]["end_at"] == "2027-01-01T00:00:00Z"
+
+
+def test_reschedule_with_new_duration(client):
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z", duration=3600)
+    b = _book(client, start="2026-06-20T11:00:00Z", duration=3600)
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T14:00:00Z",
+         "duration_seconds": 1800},
+        {"booking_id": b, "start": "2026-06-20T15:00:00Z"},  # 缺省沿用
+    ])
+    assert r.status_code == 200, r.text
+    out = {x["id"]: x for x in r.json()}
+    assert out[a]["duration_seconds"] == 1800
+    assert out[a]["end_at"] == "2026-06-20T14:30:00Z"
+    assert out[b]["duration_seconds"] == 3600
+
+
+def test_reschedule_refreshes_certificate_snapshot(client):
+    """新起点落在换发后的新证书区间：certificate_id / valid_until 快照刷新。"""
+    _chain(client)
+    # 为 W 补一张 2026-09-01 生效的换发证书（与旧证首尾相接，避免区间断档）
+    r = client.post("/api/submissions", json={
+        "instruments": [],
+        "certificates": [
+            {"id": "CW2-W", "instrument_code": "W", "cert_number": "W-W2",
+             "issued_at": "2026-08-20T00:00:00Z",
+             "valid_from": "2027-01-01T00:00:00Z",
+             "valid_until": "2028-01-01T00:00:00Z",
+             "uncertainty": 0.01, "unit": "mm"},
+        ],
+        "edges": [{"child_cert_id": "CW2-W", "parent_cert_id": "CR-W"}],
+    })
+    assert r.status_code == 201, r.text
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2027-02-01T09:00:00Z"},
+        {"booking_id": b, "start": "2027-02-01T10:00:00Z"},
+    ])
+    assert r.status_code == 200, r.text
+    for x in r.json():
+        assert x["certificate_id"] == "CW2-W"
+        assert x["certificate_valid_until"] == "2028-01-01T00:00:00Z"
+
+
+def test_reschedule_preserves_note_and_created_at(client):
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z", note="保留备注")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    before = {x["id"]: x for x in client.get("/api/calibration-bookings").json()}
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T14:00:00Z"},
+        {"booking_id": b, "start": "2026-06-20T15:00:00Z"},
+    ])
+    assert r.status_code == 200, r.text
+    after = {x["id"]: x for x in r.json()}
+    assert after[a]["note"] == "保留备注"
+    assert after[a]["created_at"] == before[a]["created_at"]
+
+
+@pytest.mark.parametrize("n", [1, 11])
+def test_reschedule_count_out_of_range_422(client, n):
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T14:00:00Z"}
+        for _ in range(n)
+    ])
+    assert r.status_code == 422
+
+
+def test_reschedule_nonpositive_new_duration_422(client):
+    _chain(client)
+    a = _book(client, start="2026-06-20T09:00:00Z")
+    b = _book(client, start="2026-06-20T11:00:00Z")
+    r = _reschedule(client, [
+        {"booking_id": a, "start": "2026-06-20T14:00:00Z",
+         "duration_seconds": 0},
+        {"booking_id": b, "start": "2026-06-20T15:00:00Z"},
+    ])
+    assert r.status_code == 422
+
+
+def test_reschedule_empty_booking_id_422(client):
+    r = _reschedule(client, [
+        {"booking_id": "", "start": "2026-06-20T14:00:00Z"},
+        {"booking_id": "BK-X", "start": "2026-06-20T15:00:00Z"},
+    ])
+    assert r.status_code == 422
